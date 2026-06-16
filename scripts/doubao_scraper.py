@@ -53,14 +53,12 @@ XMLHttpRequest.prototype.send = function(b) {
 
 
 def ensure_chrome():
-    """启动 headless Chrome，CDP 监听 18800"""
-    import urllib.request
-    try:
-        urllib.request.urlopen(CDP_URL + "/json/version", timeout=3)
-        print("Chrome CDP 已就绪")
-        return
-    except Exception:
-        pass
+    """启动 headless Chrome，CDP 监听 18800（每次干净启动）"""
+    import urllib.request, signal
+    # 先杀掉残留的 Chrome 进程，避免复用异常状态
+    subprocess.run(["pkill", "-f", "remote-debugging-port=18800"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
 
     print("启动 headless Chrome...")
     subprocess.Popen([
@@ -336,7 +334,7 @@ def main():
 
     # 单一 Playwright 实例 + 单一 CDP 连接，全程复用 browser 对象
     with sync_playwright() as pw:
-        browser = pw.chromium.connect_over_cdp(CDP_URL)
+        browser = pw.chromium.connect_over_cdp(CDP_URL, timeout=15000)
 
         if cmd == "login":
             do_login(browser)
