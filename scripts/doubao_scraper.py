@@ -210,7 +210,7 @@ def list_conversations(browser):
         time.sleep(5)
 
         total = scroll_load_all(page)
-        print(f"已加载 {total} 个会话（滚动加载完毕）")
+        print(f"共 {total} 个会话")
 
         links = page.evaluate("""() => {
             return Array.from(document.querySelectorAll('a[href*="/chat/"]'))
@@ -332,27 +332,35 @@ def main():
         if cmd == "login":
             do_login(browser)
 
-        elif cmd in ("list", "scrape"):
+        elif cmd == "list":
             if not check_login(browser):
                 print("未登录，请先执行: python3 doubao_scraper.py login")
                 sys.exit(1)
             convs = list_conversations(browser)
-            print(f"\n共 {len(convs)} 个会话，展示前 20 个：\n")
+            page_num = 1
+            args = sys.argv[2:]
+            for i, a in enumerate(args):
+                if a == '--page' and i + 1 < len(args):
+                    page_num = int(args[i + 1])
+            page_size = 20
+            start = (page_num - 1) * page_size
+            end = start + page_size
+            preview = convs[start:end]
+            total_pages = (len(convs) + page_size - 1) // page_size
+            print(f"\n共 {len(convs)} 个会话，当前显示第 {page_num} 页（{start+1}-{min(end, len(convs))}，共 {total_pages} 页）：\n")
             print(f"{'序号':<6} {'会话名称':<25} {'链接'}")
             print("─" * 70)
-            preview = convs[:20]
             for i, c in enumerate(preview):
                 short_url = c['url'].replace('https://www.doubao.com', '').replace('http://www.doubao.com', '')
                 title = c['title'][:22] + '..' if len(c['title']) > 22 else c['title']
-                print(f"{i+1:<6} {title:<25} {short_url}")
+                print(f"{start+i+1:<6} {title:<25} {short_url}")
             if convs:
-                print(f"\n爬取单个: python3 doubao_scraper.py scrape <序号>")
+                print(f"\n翻页: python3 doubao_scraper.py list --page <1-{total_pages}>")
+                print(f"爬取单个: python3 doubao_scraper.py scrape <序号>")
                 print(f"爬取全部: python3 doubao_scraper.py scrape all")
+            return
 
-            if cmd == "list":
-                return
-
-        if cmd == "scrape":
+        elif cmd == "scrape":
             if not check_login(browser):
                 print("未登录，请先执行: python3 doubao_scraper.py login")
                 sys.exit(1)
