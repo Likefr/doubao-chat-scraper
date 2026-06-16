@@ -4,7 +4,16 @@
 本机 headless Chrome + CDP，自动登录 + 获取会话列表 + hook API 爬取对话
 """
 
-import json, os, sys, time, re, subprocess
+import json, os, sys, time, re, subprocess, hashlib
+
+
+def safe_name(name):
+    """将会话名清洗为安全的文件/目录名，保留中文和字母数字"""
+    name = re.sub(r'[\\/:*?"<>|]', '', name)
+    name = name.strip()
+    if not name:
+        name = "unnamed"
+    return name
 from datetime import datetime
 
 try:
@@ -276,7 +285,7 @@ def scrape_one(browser, conv_url, conv_name):
                 pass
 
         # 生成 markdown
-        output_dir = os.path.join(OUTPUT_BASE, conv_name)
+        output_dir = os.path.join(OUTPUT_BASE, safe_name(conv_name))
         os.makedirs(output_dir, exist_ok=True)
 
         md_lines = []
@@ -386,7 +395,7 @@ def main():
                     c = convs[idx]
                     print(f"爬取: {c['title']}...")
                     count = scrape_one(browser, c["url"], c["title"])
-                    print(f"✅ {count} 条消息 → {OUTPUT_BASE}/{c['title']}/conversation.md")
+                    print(f"✅ {count} 条消息 → {OUTPUT_BASE}/{safe_name(c['title'])}/conversation.md")
                 else:
                     print(f"❌ 序号超出范围 (1-{len(convs)})")
 
