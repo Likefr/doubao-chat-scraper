@@ -1,3 +1,7 @@
-scripts/output/
+node_modules/
 __pycache__/
+output/
 *.pyc
+*.png
+*.json
+!SKILL.md

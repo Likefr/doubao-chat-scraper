@@ -181,13 +181,36 @@ def do_login(browser):
         page.close()
 
 
+def scroll_load_all(page, max_scrolls=50, stable_rounds=2):
+    """滚动 flow-scrollbar 容器到底部，加载全部会话列表"""
+    stable = 0
+    for i in range(max_scrolls):
+        before = page.evaluate('document.querySelectorAll(\'a[href*="/chat/"]\').length')
+        page.evaluate("""() => {
+            const s = document.querySelector('[class*="flow-scrollbar"]');
+            if (s) s.scrollTop = s.scrollHeight;
+        }""")
+        time.sleep(1.5)
+        after = page.evaluate('document.querySelectorAll(\'a[href*="/chat/"]\').length')
+        if before == after:
+            stable += 1
+            if stable >= stable_rounds:
+                break
+        else:
+            stable = 0
+    return page.evaluate('document.querySelectorAll(\'a[href*="/chat/"]\').length')
+
+
 def list_conversations(browser):
-    """获取侧边栏会话列表，返回 [{title, url}]"""
+    """获取侧边栏会话列表（滚动加载全部），返回 [{title, url}]"""
     page = new_page(browser)
     try:
         page.goto("https://www.doubao.com/chat/", timeout=30000)
         page.wait_for_load_state("domcontentloaded")
         time.sleep(5)
+
+        total = scroll_load_all(page)
+        print(f"已加载 {total} 个会话（滚动加载完毕）")
 
         links = page.evaluate("""() => {
             return Array.from(document.querySelectorAll('a[href*="/chat/"]'))
@@ -309,20 +332,26 @@ def main():
         if cmd == "login":
             do_login(browser)
 
-        elif cmd == "list":
+        elif cmd in ("list", "scrape"):
             if not check_login(browser):
                 print("未登录，请先执行: python3 doubao_scraper.py login")
                 sys.exit(1)
             convs = list_conversations(browser)
-            print(f"\n共 {len(convs)} 个会话：\n")
-            for i, c in enumerate(convs):
-                print(f"  {i+1}. {c['title']}")
-                print(f"     {c['url']}")
+            print(f"\n共 {len(convs)} 个会话，展示前 20 个：\n")
+            print(f"{'序号':<6} {'会话名称':<30} {'链接'}")
+            print("─" * 80)
+            preview = convs[:20]
+            for i, c in enumerate(preview):
+                short_url = c['url'].replace('https://www.doubao.com', '').replace('http://www.doubao.com', '')
+                print(f"{i+1:<6} {c['title']:<30} {short_url}")
             if convs:
                 print(f"\n爬取单个: python3 doubao_scraper.py scrape <序号>")
                 print(f"爬取全部: python3 doubao_scraper.py scrape all")
 
-        elif cmd == "scrape":
+            if cmd == "list":
+                return
+
+        if cmd == "scrape":
             if not check_login(browser):
                 print("未登录，请先执行: python3 doubao_scraper.py login")
                 sys.exit(1)
