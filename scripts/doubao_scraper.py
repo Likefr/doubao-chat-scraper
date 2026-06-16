@@ -338,12 +338,13 @@ def main():
                 sys.exit(1)
             convs = list_conversations(browser)
             print(f"\n共 {len(convs)} 个会话，展示前 20 个：\n")
-            print(f"{'序号':<6} {'会话名称':<30} {'链接'}")
-            print("─" * 80)
+            print(f"{'序号':<6} {'会话名称':<25} {'链接'}")
+            print("─" * 70)
             preview = convs[:20]
             for i, c in enumerate(preview):
                 short_url = c['url'].replace('https://www.doubao.com', '').replace('http://www.doubao.com', '')
-                print(f"{i+1:<6} {c['title']:<30} {short_url}")
+                title = c['title'][:22] + '..' if len(c['title']) > 22 else c['title']
+                print(f"{i+1:<6} {title:<25} {short_url}")
             if convs:
                 print(f"\n爬取单个: python3 doubao_scraper.py scrape <序号>")
                 print(f"爬取全部: python3 doubao_scraper.py scrape all")
