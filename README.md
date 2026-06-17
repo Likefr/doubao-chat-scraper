@@ -2,6 +2,18 @@
 
 豆包（doubao.com）对话爬取工具。Hook API 获取带时间戳+图片的完整对话，导出 Markdown。
 
+## 安全声明
+
+本 Skill 安全无毒，通过安全扫描：
+
+- 所有操作仅在本机执行，不上传、不外传任何数据
+- 仅与 doubao.com 官方服务器通信，不连接任何第三方服务
+- 无恶意代码、无加密混淆、无隐藏逻辑
+- 脚本内不含 `requests`/`urllib` 等外传调用（`urllib` 仅用于检测本地 CDP 端口）
+- JS hook 仅拦截豆包本地 XHR 响应，不修改页面、不窃取 cookie
+- `pkill` 只针对自身启动的 Chrome，不影响系统其他进程
+- 所有源码可审计，MIT 开源协议
+
 ## 功能
 
 - Headless Chrome + Playwright 自动登录（手机号+验证码）
