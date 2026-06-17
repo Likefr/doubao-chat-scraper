@@ -21,7 +21,7 @@ except ImportError:
 
 CDP_URL = "http://127.0.0.1:18800"
 CHROME_DATA_DIR = "/tmp/doubao_chrome_data"
-OUTPUT_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+OUTPUT_BASE = os.path.expanduser("~/.openclaw/workspace/doubao-exports")
 PHONE = None  # 由 send 命令的参数传入
 
 
@@ -37,6 +37,7 @@ def safe_name(name):
 # ============ XHR Hook: 拦截 /im/chain/single 响应 ============
 HOOK_JS = r"""
 window._chainResponses = [];
+// 拦截 XMLHttpRequest
 var _open = XMLHttpRequest.prototype.open;
 var _send = XMLHttpRequest.prototype.send;
 XMLHttpRequest.prototype.open = function(m, u) {
@@ -55,6 +56,21 @@ XMLHttpRequest.prototype.send = function(b) {
         };
     }
     return _send.apply(this, arguments);
+};
+// 拦截 fetch
+var _fetch = window.fetch;
+window.fetch = function(input, init) {
+    var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+    if (url.indexOf('chain/single') !== -1) {
+        return _fetch.apply(this, arguments).then(function(resp) {
+            var clone = resp.clone();
+            clone.text().then(function(txt) {
+                window._chainResponses.push(txt);
+            });
+            return resp;
+        });
+    }
+    return _fetch.apply(this, arguments);
 };
 'hooked';
 """
@@ -350,64 +366,102 @@ def list_conversations(browser):
 
 
 def scrape_one(browser, conv_url, conv_name):
-    """hook API 爬取单个会话（复用已有页面，绝不创建新的）"""
+    """hook API 爬取单个会话（复用已有页面，绝不创建新的）
+    核心策略：CDP Network 底层监听 + 鼠标滚轮向上滚动。
+    不依赖任何页面 JS hook，不被 SPA 路由影响。"""
     page = find_existing_page(browser)
     if not page:
         print("  ❌ 没有已登录页面，无法爬取")
         return 0
     try:
-        page.add_init_script(HOOK_JS)
-        page.goto(conv_url, timeout=30000, wait_until="load")
-        page.reload()
-        page.wait_for_load_state("load", timeout=15000)
-        page.wait_for_timeout(3000)
+        t0 = time.time()
 
-        # 强制 scrollTop=0 加载全部历史
-        page.evaluate("""() => {
-            window._done = false; window._lastSh = 0; window._stableCount = 0;
-            window._scrollIv = setInterval(function() {
-                var s = document.querySelector('[class*="v_list_scroller"]');
+        # CDP 底层网络监听（不依赖页面 JS）
+        cdp = page.context.new_cdp_session(page)
+        cdp.send("Network.enable")
+        cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
+        captured = []  # 存储所有 chain/single 响应 body
+        pending_ids = {}  # requestId -> url（等待 loadingFinished）
+
+        def on_response_received(params):
+            resp = params.get("response", {})
+            url = resp.get("url", "")
+            req_id = params.get("requestId", "")
+            if "chain/single" in url and resp.get("status") == 200:
+                pending_ids[req_id] = url
+
+        def on_loading_finished(params):
+            req_id = params.get("requestId", "")
+            if req_id in pending_ids:
+                try:
+                    body = cdp.send("Network.getResponseBody", {"requestId": req_id})
+                    raw = body.get("body", "")
+                    if raw:
+                        captured.append(raw)
+                except Exception:
+                    pass
+                del pending_ids[req_id]
+
+        cdp.on("Network.responseReceived", on_response_received)
+        cdp.on("Network.loadingFinished", on_loading_finished)
+
+        # 导航到目标会话（load 阶段首屏 API 已返回，不需额外等 DOM）
+        page.goto(conv_url, timeout=30000, wait_until="load")
+        t1 = time.time()
+        page.wait_for_timeout(1000)
+        t2 = time.time()
+
+        print(f"    加载历史...", end="", flush=True)
+        last_count = 0
+        quiet_start = time.time()
+        QUIET_SEC = 2.0
+
+        # 鼠标滚轮不断向上 + JS scrollTop=0 + 点击「更早」按钮
+        while time.time() - quiet_start < QUIET_SEC:
+            page.mouse.wheel(0, -200)
+            page.evaluate("""() => {
+                const s = document.querySelector('[class*="v_list_scroller"]');
                 if (!s) return;
                 s.scrollTop = 0;
-                if (s.scrollHeight === window._lastSh) {
-                    window._stableCount++;
-                    if (window._stableCount > 20) {
-                        clearInterval(window._scrollIv);
-                        window._done = true;
-                    }
-                } else {
-                    window._stableCount = 0;
-                    window._lastSh = s.scrollHeight;
-                }
-            }, 150);
-        }""")
+                s.dispatchEvent(new Event('scroll', {bubbles: true}));
+                const btn = Array.from(document.querySelectorAll('button, [role="button"]'))
+                    .find(b => /更早|查看更多|加载更多|展开/.test(b.innerText || ''));
+                if (btn) btn.click();
+            }""")
+            page.wait_for_timeout(150)
+            cur = len(captured)
+            if cur > last_count:
+                last_count = cur
+                quiet_start = time.time()
 
-        for _ in range(120):
-            if page.evaluate("window._done"):
-                break
-            page.wait_for_timeout(800)
-        page.wait_for_timeout(2000)
+        t3 = time.time()
+        cdp.remove_listener("Network.responseReceived", on_response_received)
+        cdp.remove_listener("Network.loadingFinished", on_loading_finished)
+        cdp.send("Network.disable")
 
         # 解析消息
-        all_msgs = {}
-        resp_count = page.evaluate("window._chainResponses.length")
-        for i in range(resp_count):
-            raw = page.evaluate(f"window._chainResponses[{i}]")
+        all_msgs_data = {}
+        for raw in captured:
             try:
                 j = json.loads(raw)
                 for m in j.get("downlink_body", {}).get("pull_singe_chain_downlink_body", {}).get("messages", []):
                     mid = m.get("message_id", "")
-                    if mid and mid not in all_msgs:
-                        all_msgs[mid] = m
+                    if mid and mid not in all_msgs_data:
+                        all_msgs_data[mid] = m
             except Exception:
                 pass
+        t4 = time.time()
+        print(f" {last_count} 个API响应，{len(all_msgs_data)} 条消息", flush=True)
+        print(f"    [计时] nav={t1-t0:.1f}s init={t2-t1:.1f}s scroll={t3-t2:.1f}s parse={t4-t3:.1f}s", flush=True)
 
         # 生成 markdown
-        output_dir = os.path.join(OUTPUT_BASE, safe_name(conv_name))
+        # 统一用 chat_id 作为文件夹名（唯一且可靠）
+        conv_id = conv_url.rstrip("/").split("/")[-1]
+        output_dir = os.path.join(OUTPUT_BASE, conv_id)
         os.makedirs(output_dir, exist_ok=True)
 
         md_lines = []
-        for m in sorted(all_msgs.values(), key=lambda x: int(x.get("create_time", 0))):
+        for m in sorted(all_msgs_data.values(), key=lambda x: int(x.get("create_time", 0))):
             ct = int(m.get("create_time", 0))
             ts = datetime.fromtimestamp(ct).strftime("%Y-%m-%d %H:%M:%S")
             role = "我" if m.get("user_type", 0) == 1 else "豆包"
@@ -503,16 +557,33 @@ def main():
                 print("未登录，请先执行: python3 doubao_scraper.py send")
                 sys.exit(1)
 
+            arg = sys.argv[2] if len(sys.argv) > 2 else "all"
+
+            # scrape_by_id: 不走 list，直接用 chat_id（快）
+            if arg.startswith("http") or arg.isdigit() and len(arg) > 15:
+                # chat_id 数字或完整 URL
+                if arg.isdigit():
+                    conv_url = f"https://www.doubao.com/chat/{arg}"
+                else:
+                    conv_url = arg
+                conv_id = conv_url.rstrip("/").split("/")[-1]
+                print(f"爬取: {conv_id}...")
+                count = scrape_one(browser, conv_url, conv_id)
+                print(f"✅ {count} 条消息 → {OUTPUT_BASE}/{conv_id}/conversation.md")
+                return
+
+            # scrape all / scrape <序号> 需要先 list
             convs = list_conversations(browser)
             if not convs:
                 print("❌ 没有可爬取的会话")
                 sys.exit(1)
 
-            arg = sys.argv[2] if len(sys.argv) > 2 else "all"
-
             if arg.lower() == "all":
                 total = 0
                 for i, c in enumerate(convs):
+                    if i == 0:
+                        print(f"\n[{i+1}/{len(convs)}] 跳过: {c['title']} (主对话)")
+                        continue
                     print(f"\n[{i+1}/{len(convs)}] 爬取: {c['title']}...")
                     count = scrape_one(browser, c["url"], c["title"])
                     total += count
