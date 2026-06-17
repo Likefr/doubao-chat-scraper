@@ -3,5 +3,3 @@ __pycache__/
 output/
 *.pyc
 *.png
-*.json
-!SKILL.md
