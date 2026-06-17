@@ -15,7 +15,8 @@ $SCRIPT list                   # 滚动加载全部会话，分页输出
 $SCRIPT list --page N         # 第 N 页
 $SCRIPT scrape <chat_id>       # 爬单个（推荐，跳过list，最快）
 $SCRIPT scrape <序号>          # 爬单个（需先list）
-$SCRIPT scrape all            # 爬全部（需先list，~30s）
+$SCRIPT scrape <起始>-<结束>   # 爬范围，如 scrape 2-20（默认4并发）
+$SCRIPT scrape all            # 爬全部（默认4并发，--parallel N 可调）
 ```
 
 ## 导出

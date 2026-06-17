@@ -721,6 +721,26 @@ def main():
                 print("❌ 没有可爬取的会话")
                 sys.exit(1)
 
+            # 范围爬取: scrape 2-20
+            if '-' in arg and not arg.startswith('http'):
+                parts = arg.split('-')
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    start_idx = int(parts[0]) - 1
+                    end_idx = int(parts[1])
+                    slice_convs = convs[start_idx:end_idx]
+                    if not slice_convs:
+                        print(f"❌ 范围 {arg} 无有效会话")
+                    else:
+                        workers = 4
+                        args_list = sys.argv[2:]
+                        for j in range(len(args_list)):
+                            if args_list[j] == "--parallel" and j + 1 < len(args_list):
+                                workers = int(args_list[j + 1])
+                                break
+                        print(f"爬取范围: 序号 {parts[0]}-{parts[1]}（共 {len(slice_convs)} 个会话，{workers} 并发）")
+                        scrape_all_parallel(browser, slice_convs, workers=workers)
+                    return
+
             if arg.lower() == "all":
                 workers = 4  # 默认4并发
                 args = sys.argv[2:]
