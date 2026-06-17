@@ -10,7 +10,7 @@
 - 每次运行连接已有 CDP 进程，不重复启动 Chrome
 """
 
-import json, os, sys, time, re, subprocess, hashlib
+import json, os, sys, time, re, subprocess, hashlib, threading
 from datetime import datetime
 
 try:
@@ -367,19 +367,49 @@ def list_conversations(browser):
         return []
 
 
-def scrape_one(browser, conv_url, conv_name):
-    """hook API 爬取单个会话（复用已有页面，绝不创建新的）
-    核心策略：CDP Network 底层监听 + 鼠标滚轮向上滚动。
-    不依赖任何页面 JS hook，不被 SPA 路由影响。"""
-    page = find_existing_page(browser)
-    if not page:
-        print("  ❌ 没有已登录页面，无法爬取")
-        return 0
+def generate_markdown(all_msgs_data, conv_url):
+    """纯数据处理：从消息 dict 生成 markdown，返回 (行数, 输出路径)"""
+    conv_id = conv_url.rstrip("/").split("/")[-1]
+    output_dir = os.path.join(OUTPUT_BASE, conv_id)
+    os.makedirs(output_dir, exist_ok=True)
+    md_lines = []
+    for m in sorted(all_msgs_data.values(), key=lambda x: int(x.get("create_time", 0))):
+        ct = int(m.get("create_time", 0))
+        ts = datetime.fromtimestamp(ct).strftime("%Y-%m-%d %H:%M:%S")
+        role = "我" if m.get("user_type", 0) == 1 else "豆包"
+        text, images = "", []
+        for cb in m.get("content_block", []):
+            bt = cb.get("block_type", 0)
+            if bt == 10052:
+                for att in cb.get("content", {}).get("attachment_block", {}).get("attachments", []):
+                    url = (att.get("image", {}).get("image_ori", {}).get("url", "") or
+                           att.get("image", {}).get("image_thumb", {}).get("url", ""))
+                    if url: images.append(url)
+            elif bt == 10000:
+                tb = cb.get("content", {}).get("text_block", {}).get("text", "")
+                if tb: text = tb; break
+        if not text: text = m.get("content", "")
+        parts = [text] if text else []
+        for url in images: parts.append(f"![图片]({url})")
+        content_str = "\n\n".join(parts)
+        if content_str:
+            md_lines.append(f"**{role}：** `{ts}`\n\n{content_str}\n\n---\n")
+    md_path = os.path.join(output_dir, "conversation.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("".join(md_lines))
+    return len(md_lines), md_path
+
+
+def scrape_one_tab(context, conv_url, conv_name):
+    """在独立 tab 中爬取单个会话（并发安全）
+    每个调用创建独立 page + 独立 CDP session，互不干扰。
+    核心策略：CDP Network 底层监听 + 鼠标滚轮向上滚动。"""
+    page = context.new_page()
     try:
         t0 = time.time()
 
-        # CDP 底层网络监听（不依赖页面 JS）
-        cdp = page.context.new_cdp_session(page)
+        # CDP 底层网络监听（独立 session，tab 间隔离）
+        cdp = context.new_cdp_session(page)
         cdp.send("Network.enable")
         cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
         captured = []  # 存储所有 chain/single 响应 body
@@ -440,8 +470,6 @@ def scrape_one(browser, conv_url, conv_name):
         cdp.remove_listener("Network.responseReceived", on_response_received)
         cdp.remove_listener("Network.loadingFinished", on_loading_finished)
         cdp.send("Network.disable")
-
-        # 解析消息
         all_msgs_data = {}
         for raw in captured:
             try:
@@ -499,6 +527,119 @@ def scrape_one(browser, conv_url, conv_name):
     except Exception as e:
         print(f"  ❌ 失败: {e}")
         return 0
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+def scrape_one(browser, conv_url, conv_name):
+    """单爬兼容层：复用已有页面（不创建新 tab）"""
+    page = find_existing_page(browser)
+    if not page:
+        print("  ❌ 没有已登录页面，无法爬取")
+        return 0
+    return scrape_one_tab(page.context, conv_url, conv_name)
+
+
+def scrape_all_parallel(browser, convs, workers=4):
+    """并发爬取所有会话（async 多 tab 并行，共享 context cookie）
+    Playwright sync API 不支持多线程（greenlet 绑定线程），
+    用 asyncio + async Playwright API 实现真并发。"""
+    import asyncio
+    from playwright.async_api import async_playwright
+
+    async def _run():
+        pw = await async_playwright().start()
+        br = await pw.chromium.connect_over_cdp(CDP_URL)
+        ctx = br.contexts[0]
+
+        skip = 1  # 跳过主对话
+        tasks_conv = [(i, c) for i, c in enumerate(convs) if i >= skip]
+        total = len(tasks_conv)
+        done = [0]
+        total_msgs = [0]
+        lock = asyncio.Lock()
+
+        async def worker(idx, conv):
+            page = await ctx.new_page()
+            try:
+                responses = []
+
+                async def on_response(resp):
+                    if "chain/single" in resp.url and resp.status == 200:
+                        try:
+                            body = await resp.body()
+                            if body:
+                                responses.append(body)
+                        except Exception:
+                            pass
+
+                page.on("response", on_response)
+
+                await page.goto(conv["url"], timeout=30000, wait_until="load")
+                await page.wait_for_timeout(1000)
+
+                quiet_start = time.time()
+                last_count = 0
+                while time.time() - quiet_start < 2.0:
+                    await page.mouse.wheel(0, -200)
+                    await page.evaluate("""() => {
+                        const s = document.querySelector('[class*="v_list_scroller"]');
+                        if (!s) return;
+                        s.scrollTop = 0;
+                        s.dispatchEvent(new Event('scroll', {bubbles: true}));
+                        const btn = Array.from(document.querySelectorAll('button, [role="button"]'))
+                            .find(b => /更早|查看更多|加载更多|展开/.test(b.innerText || ''));
+                        if (btn) btn.click();
+                    }""")
+                    await page.wait_for_timeout(150)
+                    cur = len(responses)
+                    if cur > last_count:
+                        last_count = cur
+                        quiet_start = time.time()
+
+                page.remove_listener("response", on_response)
+
+                # 解析
+                all_msgs_data = {}
+                for raw in responses:
+                    try:
+                        j = json.loads(raw)
+                        for m in j.get("downlink_body", {}).get("pull_singe_chain_downlink_body", {}).get("messages", []):
+                            mid = m.get("message_id", "")
+                            if mid and mid not in all_msgs_data:
+                                all_msgs_data[mid] = m
+                    except Exception:
+                        pass
+
+                count = generate_markdown(all_msgs_data, conv["url"])[0]
+                async with lock:
+                    done[0] += 1
+                    total_msgs[0] += count
+                    print(f"  [{done[0]}/{total}] ✅ {conv['title']}: {count} 条消息")
+                return count
+            except Exception as e:
+                print(f"  ❌ {conv['title']}: {e}")
+                return 0
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+        t0 = time.time()
+        print(f"\n🚀 并发爬取开始: {total} 个会话, {workers} 并发")
+        await asyncio.gather(*[worker(idx, conv) for idx, conv in tasks_conv])
+        elapsed = time.time() - t0
+        print(f"\n🎉 并发({workers})爬取完成，共 {total_msgs[0]} 条消息, 耗时 {elapsed:.1f}s → {OUTPUT_BASE}/")
+        await pw.stop()
+        return total_msgs[0]
+
+    import nest_asyncio
+    nest_asyncio.apply()
+    return asyncio.get_event_loop().run_until_complete(_run())
 
 
 def main():
@@ -581,23 +722,20 @@ def main():
                 sys.exit(1)
 
             if arg.lower() == "all":
-                total = 0
-                for i, c in enumerate(convs):
-                    if i == 0:
-                        print(f"\n[{i+1}/{len(convs)}] 跳过: {c['title']} (主对话)")
-                        continue
-                    print(f"\n[{i+1}/{len(convs)}] 爬取: {c['title']}...")
-                    count = scrape_one(browser, c["url"], c["title"])
-                    total += count
-                    print(f"  ✅ {count} 条消息")
-                print(f"\n🎉 全部完成，共 {total} 条消息 → {OUTPUT_BASE}/")
+                workers = 4  # 默认4并发
+                args = sys.argv[2:]
+                for j in range(len(args)):
+                    if args[j] == "--parallel" and j + 1 < len(args):
+                        workers = int(args[j + 1])
+                        break
+                scrape_all_parallel(browser, convs, workers=workers)
             else:
                 idx = int(arg) - 1
                 if 0 <= idx < len(convs):
                     c = convs[idx]
                     print(f"爬取: {c['title']}...")
                     count = scrape_one(browser, c["url"], c["title"])
-                    print(f"✅ {count} 条消息 → {OUTPUT_BASE}/{safe_name(c['title'])}/conversation.md")
+                    print(f"✅ {count} 条消息 → {OUTPUT_BASE}/{c['url'].rstrip('/').split('/')[-1]}/conversation.md")
                 else:
                     print(f"❌ 序号超出范围 (1-{len(convs)})")
 
@@ -608,6 +746,7 @@ def main():
             print("  python3 doubao_scraper.py list           # 列出所有会话")
             print("  python3 doubao_scraper.py scrape <序号> # 爬取指定会话")
             print("  python3 doubao_scraper.py scrape all     # 爬取全部会话")
+            print("  python3 doubao_scraper.py scrape all --parallel 4  # 并发爬取（推荐）")
 
 
 if __name__ == "__main__":
