@@ -2,18 +2,15 @@
 """
 豆包对话爬取工具
 本机 headless Chrome + CDP，自动登录 + 获取会话列表 + hook API 爬取对话
+
+⚠️ 核心原则：
+- 永远不关闭已有页面
+- 永远不创建多余新页面（只在完全没有豆包页面时才创建）
+- 所有操作复用同一个已登录页面
+- 每次运行连接已有 CDP 进程，不重复启动 Chrome
 """
 
 import json, os, sys, time, re, subprocess, hashlib
-
-
-def safe_name(name):
-    """将会话名清洗为安全的文件/目录名，保留中文和字母数字"""
-    name = re.sub(r'[\\/:*?"<>|]', '', name)
-    name = name.strip()
-    if not name:
-        name = "unnamed"
-    return name
 from datetime import datetime
 
 try:
@@ -25,6 +22,17 @@ except ImportError:
 CDP_URL = "http://127.0.0.1:18800"
 CHROME_DATA_DIR = "/tmp/doubao_chrome_data"
 OUTPUT_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+PHONE = None  # 由 send 命令的参数传入
+
+
+def safe_name(name):
+    """将会话名清洗为安全的文件/目录名，保留中文和字母数字"""
+    name = re.sub(r'[\\/:*?"<>|]', '', name)
+    name = name.strip()
+    if not name:
+        name = "unnamed"
+    return name
+
 
 # ============ XHR Hook: 拦截 /im/chain/single 响应 ============
 HOOK_JS = r"""
@@ -53,9 +61,18 @@ XMLHttpRequest.prototype.send = function(b) {
 
 
 def ensure_chrome():
-    """启动 headless Chrome，CDP 监听 18800（每次干净启动）"""
-    import urllib.request, signal
-    # 先杀掉残留的 Chrome 进程，避免复用异常状态
+    """启动 headless Chrome，CDP 监听 18800（复用已有进程，不重复启动）"""
+    import urllib.request
+
+    # 先检测是否已有 Chrome 在 18800 端口运行
+    try:
+        urllib.request.urlopen(CDP_URL + "/json/version", timeout=2)
+        print("Chrome CDP 已就绪（复用已有进程）")
+        return
+    except Exception:
+        pass
+
+    # 没有已有进程才启动新的
     subprocess.run(["pkill", "-f", "remote-debugging-port=18800"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
@@ -81,111 +98,202 @@ def ensure_chrome():
     sys.exit(1)
 
 
+def find_existing_page(browser):
+    """从已有页面中找豆包页面，复用（不创建新的）
+    优先找已在 chat 页面的，其次找任何 doubao.com 页面"""
+    for ctx in browser.contexts:
+        for page in ctx.pages:
+            if "doubao.com/chat/" in page.url and page.url != "https://www.doubao.com/chat/":
+                return page
+    for ctx in browser.contexts:
+        for page in ctx.pages:
+            if "doubao.com" in page.url:
+                return page
+    return None
+
+
 def new_page(browser):
-    """从 browser 创建新 page，自动选 context"""
+    """创建新 page（仅在完全没有豆包页面时的最后手段）"""
+    print("⚠️ 创建新页面（没有找到已有豆包页面）")
     ctx = browser.contexts[0] if browser.contexts else browser.new_context()
     return ctx.new_page()
 
 
-def check_login(browser):
-    """判断是否已登录"""
-    page = new_page(browser)
-    try:
-        page.goto("https://www.doubao.com/chat/", timeout=30000)
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(4)
+def get_or_create_page(browser):
+    """获取豆包页面：优先复用已有页面，只有在没有任何豆包页面时才创建新的
+    ⚠️ 核心原则：不关闭任何已有页面，不创建多余新页面"""
+    page = find_existing_page(browser)
+    if page:
+        page.reload()
+        page.wait_for_load_state("load", timeout=15000)
+        page.wait_for_timeout(2000)
         url = page.url
         if "from_login=1" in url:
-            return True
-        for btn in page.query_selector_all("button"):
-            if btn.inner_text().strip() == "登录" and btn.is_visible():
-                return False
-        return True
-    finally:
-        page.close()
-
-
-def do_login(browser):
-    """自动登录：需要用户提供手机号和验证码"""
+            return True, page
+        has_login_btn = any(b.inner_text().strip() == "登录" and b.is_visible()
+                           for b in page.query_selector_all("button"))
+        return (not has_login_btn), page
+    # 没有已有页面才创建新的
     page = new_page(browser)
+    try:
+        page.goto("https://www.doubao.com/chat/", timeout=30000, wait_until="load")
+        page.wait_for_timeout(3000)
+        url = page.url
+        if "from_login=1" in url:
+            return True, page
+        has_login_btn = any(b.inner_text().strip() == "登录" and b.is_visible()
+                           for b in page.query_selector_all("button"))
+        return (not has_login_btn), page
+    except Exception:
+        return False, page
+
+
+def check_login(browser):
+    """判断是否已登录（复用已有页面）"""
+    logged, page = get_or_create_page(browser)
+    return logged, page
+
+
+def do_login_send(browser, phone):
+    """登录第一步：发验证码（复用已有页面，不创建新的）"""
+    page = find_existing_page(browser)
+    if not page:
+        page = new_page(browser)
+        page.goto("https://www.doubao.com/chat/", timeout=30000, wait_until="load")
+        page.wait_for_timeout(3000)
+    else:
+        # 复用已有页面，不 goto（避免冲掉弹窗）
+        # 检查是否已有验证码弹窗（必须是验证码输入状态，不是手机号输入状态）
+        has_code_modal = page.evaluate("""() => {
+            const m = document.querySelector('.semi-modal-content');
+            if (!m) return false;
+            const text = m.innerText || '';
+            return text.includes('验证码') || text.includes('6 位');
+        }""")
+        if has_code_modal:
+            print("验证码弹窗已存在")
+            print("\n✅ 验证码已发送，等你告之")
+            print("用法: python3 doubao_scraper.py verify <验证码>")
+            return True
+
+        # 没有验证码弹窗，刷新页面重新走登录流程
+        page.reload()
+        page.wait_for_load_state("load", timeout=15000)
+        page.wait_for_timeout(2000)
 
     try:
-        print("\n需要登录豆包，请提供信息：")
-
-        phone = input("手机号: ").strip()
-        if not phone:
-            print("❌ 手机号不能为空")
-            return False
-
-        # 点击登录按钮
-        for btn in page.query_selector_all("button"):
-            if btn.inner_text().strip() == "登录" and btn.is_visible():
-                btn.click()
-                break
-        time.sleep(2)
-
-        # 输入手机号
-        phone_input = page.query_selector('input[placeholder="请输入手机号"]')
-        if not phone_input:
-            print("❌ 找不到手机号输入框")
-            return False
-        phone_input.fill(phone)
-        time.sleep(0.5)
-
-        # 勾选协议 checkbox
-        checkbox = page.query_selector('button[aria-checked="false"][class*="cursor-pointer"]')
-        if checkbox:
-            checkbox.click()
-            time.sleep(0.3)
-        else:
-            print("⚠️ 找不到协议 checkbox，尝试继续")
-
-        # 点击下一步（发送验证码）
-        for btn in page.query_selector_all("button"):
-            if btn.inner_text().strip() == "下一步" and btn.is_visible():
-                btn.click()
-                print("验证码已发送")
-                break
-        else:
-            print("❌ 找不到'下一步'按钮")
-            return False
-
-        time.sleep(2)
-
-        # 输入验证码
-        code = input("验证码: ").strip()
-        if not code:
-            print("❌ 验证码不能为空")
-            return False
-
-        # 找验证码输入框（非 file 的 input）
-        inputs = page.query_selector_all("input")
-        code_input = None
-        for inp in inputs:
-            if inp.get_attribute("type") != "file":
-                code_input = inp
-        if code_input:
-            code_input.fill(code)
-        else:
-            print("❌ 找不到验证码输入框")
-            return False
-        time.sleep(0.5)
-
-        # 点击登录
-        for btn in page.query_selector_all("button"):
-            text = btn.inner_text().strip()
-            if ("登录" in text or "确认" in text) and btn.is_visible() and text != "登录":
-                btn.click()
-                break
-        time.sleep(5)
-
-        if "from_login=1" in page.url:
-            print("✅ 登录成功")
+        # 先确认当前是未登录状态
+        if page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('button')).some(b => b.innerText.trim() === 'Likefr');
+        }"""):
+            print("❌ 当前已是登录状态，无需重复登录")
             return True
-        print(f"⚠️ 当前 URL: {page.url}，登录状态不确定")
-        return True
-    finally:
-        page.close()
+
+        # 点登录按钮
+        page.evaluate("""() => {
+            const btn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.trim() === '登录' && b.offsetParent !== null);
+            if (btn) btn.click();
+        }""")
+        page.wait_for_selector('input[placeholder="请输入手机号"]', timeout=10000)
+        page.fill('input[placeholder="请输入手机号"]', phone)
+
+        # 勾协议 — 等协议按钮出现再点
+        page.wait_for_selector('button[aria-checked="false"]', timeout=5000)
+        page.evaluate("""() => {
+            const cb = document.querySelector('button[aria-checked="false"]');
+            if (cb) cb.click();
+        }""")
+
+        # 点下一步 — 等按钮可点击
+        page.wait_for_selector('button:has-text("下一步")', state="visible", timeout=5000)
+        page.evaluate("""() => {
+            const btn = Array.from(document.querySelectorAll('button'))
+                .find(b => b.innerText.trim() === '下一步' && b.offsetParent !== null);
+            if (btn) btn.click();
+        }""")
+
+        # 等待验证码弹窗出现（用 wait_for_selector，不用 sleep 轮询）
+        print("等待验证码弹窗...")
+        try:
+            page.wait_for_selector('.semi-modal-content input[type="text"]', timeout=15000)
+            modal = page.evaluate("""() => {
+                const m = document.querySelector('.semi-modal-content');
+                return m ? m.innerText.substring(0, 120) : '';
+            }""")
+            print(f"弹窗内容: {modal}")
+            print("\n✅ 验证码已发送，等你告之")
+            print("用法: python3 doubao_scraper.py verify <验证码>")
+            return True
+        except Exception:
+            # 超时，看看当前状态
+            dialog = page.evaluate("""() => {
+                const d = document.querySelector('[role="dialog"], dialog, .semi-modal-content');
+                return d ? d.innerText.substring(0, 80) : 'no dialog';
+            }""")
+            print(f"⚠️ 验证码弹窗未出现，当前: {dialog}")
+            return False
+    except Exception as e:
+        print(f"❌ 发送失败: {e}")
+        return False
+
+
+def do_login_verify(browser, code):
+    """登录第二步：填验证码（在已有验证码弹窗页面上操作）"""
+    page = find_existing_page(browser)
+    if not page:
+        print("❌ 没有找到已有页面，请先运行 send")
+        return False
+
+    try:
+        print(f"填入验证码: {code}")
+
+        # 清空并聚焦验证码input
+        page.evaluate("""() => {
+            const modal = document.querySelector('.semi-modal-content');
+            const input = modal?.querySelector('input[type="text"]');
+            if (input) { input.focus(); input.value = ''; }
+        }""")
+        page.wait_for_timeout(50)
+
+        # 用键盘逐字输入（不能用 fill，否则值会被React覆盖）
+        page.keyboard.type(code, delay=80)
+        page.wait_for_timeout(100)
+
+        # 点验证码弹窗里的 semi-button-primary（确认按钮）
+        # 用 expect_navigation 监听跳转，像 WebView onPageFinished 一样
+        try:
+            with page.expect_navigation(url="**/chat/**", timeout=15000):
+                page.evaluate("""() => {
+                    const modal = document.querySelector('.semi-modal-content');
+                    const btn = modal?.querySelector('button.semi-button-primary');
+                    if (btn) {
+                        btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                    }
+                }""")
+            page.wait_for_load_state("load", timeout=10000)
+            print(f"\n✅✅✅ 登录成功！URL: {page.url}")
+            return True
+        except Exception as nav_err:
+            # 没有跳转，可能是验证码错误
+            modal_text = page.evaluate("""() => {
+                const m = document.querySelector('.semi-modal-content');
+                return m ? m.innerText.substring(0, 80) : '';
+            }""")
+            if '验证码错误' in modal_text or '验证码已过期' in modal_text:
+                print(f"\n❌ {modal_text}")
+                return False
+            # 弹窗消失了但没导航，检查页面状态
+            has_login = page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('button')).some(b => b.innerText.trim() === '登录' && b.offsetParent !== null);
+            }""")
+            if not has_login:
+                print(f"\n✅✅✅ 登录成功！（弹窗消失，无登录按钮）")
+                return True
+            print(f"⚠️ 登录状态不确定: {modal_text}")
+            return False
+    except Exception as e:
+        print(f"❌ 验证失败: {e}")
+        return False
 
 
 def scroll_load_all(page, max_scrolls=50, stable_rounds=2):
@@ -197,7 +305,7 @@ def scroll_load_all(page, max_scrolls=50, stable_rounds=2):
             const s = document.querySelector('[class*="flow-scrollbar"]');
             if (s) s.scrollTop = s.scrollHeight;
         }""")
-        time.sleep(1.5)
+        page.wait_for_timeout(800)
         after = page.evaluate('document.querySelectorAll(\'a[href*="/chat/"]\').length')
         if before == after:
             stable += 1
@@ -209,12 +317,20 @@ def scroll_load_all(page, max_scrolls=50, stable_rounds=2):
 
 
 def list_conversations(browser):
-    """获取侧边栏会话列表（滚动加载全部），返回 [{title, url}]"""
-    page = new_page(browser)
+    """获取侧边栏会话列表（滚动加载全部），返回 [{title, url}]
+    ⚠️ 复用已有页面，不创建新的"""
+    page = find_existing_page(browser)
+    if not page:
+        page = new_page(browser)
+        try:
+            page.goto("https://www.doubao.com/chat/", timeout=30000, wait_until="load")
+            page.wait_for_timeout(3000)
+        except Exception:
+            return []
     try:
-        page.goto("https://www.doubao.com/chat/", timeout=30000)
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(5)
+        # 导航到聊天首页（复用已有页面，不刷新避免丢失登录态）
+        page.goto("https://www.doubao.com/chat/", timeout=30000, wait_until="load")
+        page.wait_for_timeout(3000)
 
         total = scroll_load_all(page)
         print(f"共 {total} 个会话")
@@ -228,19 +344,23 @@ def list_conversations(browser):
         if not links:
             print("⚠️ 未获取到会话列表")
         return links
-    finally:
-        page.close()
+    except Exception as e:
+        print(f"❌ 获取会话列表失败: {e}")
+        return []
 
 
 def scrape_one(browser, conv_url, conv_name):
-    """hook API 爬取单个会话"""
-    page = new_page(browser)
+    """hook API 爬取单个会话（复用已有页面，绝不创建新的）"""
+    page = find_existing_page(browser)
+    if not page:
+        print("  ❌ 没有已登录页面，无法爬取")
+        return 0
     try:
         page.add_init_script(HOOK_JS)
-        page.goto(conv_url, timeout=30000)
+        page.goto(conv_url, timeout=30000, wait_until="load")
         page.reload()
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(6)
+        page.wait_for_load_state("load", timeout=15000)
+        page.wait_for_timeout(3000)
 
         # 强制 scrollTop=0 加载全部历史
         page.evaluate("""() => {
@@ -265,8 +385,8 @@ def scrape_one(browser, conv_url, conv_name):
         for _ in range(120):
             if page.evaluate("window._done"):
                 break
-            time.sleep(1)
-        time.sleep(3)
+            page.wait_for_timeout(800)
+        page.wait_for_timeout(2000)
 
         # 解析消息
         all_msgs = {}
@@ -323,8 +443,6 @@ def scrape_one(browser, conv_url, conv_name):
     except Exception as e:
         print(f"  ❌ 失败: {e}")
         return 0
-    finally:
-        page.close()
 
 
 def main():
@@ -336,12 +454,24 @@ def main():
     with sync_playwright() as pw:
         browser = pw.chromium.connect_over_cdp(CDP_URL, timeout=15000)
 
-        if cmd == "login":
-            do_login(browser)
+        if cmd == "send":
+            phone = sys.argv[2] if len(sys.argv) > 2 else ""
+            if not phone:
+                print("用法: python3 doubao_scraper.py send <手机号>")
+            else:
+                do_login_send(browser, phone)
+
+        elif cmd == "verify":
+            code = sys.argv[2] if len(sys.argv) > 2 else ""
+            if not code:
+                print("用法: python3 doubao_scraper.py verify <验证码>")
+            else:
+                do_login_verify(browser, code)
 
         elif cmd == "list":
-            if not check_login(browser):
-                print("未登录，请先执行: python3 doubao_scraper.py login")
+            logged, _ = check_login(browser)
+            if not logged:
+                print("未登录，请先执行: python3 doubao_scraper.py send")
                 sys.exit(1)
             convs = list_conversations(browser)
             page_num = 1
@@ -368,8 +498,9 @@ def main():
             return
 
         elif cmd == "scrape":
-            if not check_login(browser):
-                print("未登录，请先执行: python3 doubao_scraper.py login")
+            logged, _ = check_login(browser)
+            if not logged:
+                print("未登录，请先执行: python3 doubao_scraper.py send")
                 sys.exit(1)
 
             convs = list_conversations(browser)
@@ -399,8 +530,9 @@ def main():
 
         else:
             print("用法:")
-            print("  python3 doubao_scraper.py login        # 登录豆包（手机号+验证码）")
-            print("  python3 doubao_scraper.py list          # 列出所有会话")
+            print("  python3 doubao_scraper.py send           # 登录：发验证码")
+            print("  python3 doubao_scraper.py verify <验证码> # 登录：填验证码完成")
+            print("  python3 doubao_scraper.py list           # 列出所有会话")
             print("  python3 doubao_scraper.py scrape <序号> # 爬取指定会话")
             print("  python3 doubao_scraper.py scrape all     # 爬取全部会话")
 
