@@ -21,7 +21,9 @@ except ImportError:
 
 CDP_URL = "http://127.0.0.1:18800"
 CHROME_DATA_DIR = "/tmp/doubao_chrome_data"
-OUTPUT_BASE = os.path.expanduser("~/.openclaw/workspace/doubao-exports")
+# 导出目录：脚本所在目录的 output/（clone 就能用）
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_BASE = os.path.join(os.path.dirname(SCRIPT_DIR), "output")
 PHONE = None  # 由 send 命令的参数传入
 
 

@@ -20,7 +20,7 @@ $SCRIPT scrape all            # 爬全部（需先list，~30s）
 
 ## 导出
 
-- **路径**：`~/.openclaw/workspace/doubao-exports/`（workspace 下，删 skill 不丢数据）
+- **路径**：`<clone目录>/output/<chat_id>/conversation.md`（跟随项目目录，clone 就能用）
 - **文件夹命名**：统一用 chat_id（如 `38426519926531074`），唯一可靠
 - **文件**：`conversation.md`，格式：`**角色：** \`时间\` \n\n内容\n\n---\n`
 
